@@ -62,6 +62,8 @@
 #include "TritonToStructured/CannonicalizerConverter.h"
 #include "TritonToStructured/MaskAnalysis.h"
 #include "TritonToStructured/PtrAnalysis.h"
+#include "TritonToStructured/SegmentLift.h"
+#include "TritonToStructured/SegmentPlan.h"
 #include "TritonToStructured/TritonToStructuredPass.h"
 #include "Utils/InterleaveOptimization.h"
 #include "Utils/Utils.h"
@@ -77,6 +79,15 @@ using namespace TritonToStructured;
 
 LogicalResult LoadConverter::matchAndRewrite(triton::LoadOp op,
                                              PatternRewriter &rewriter) const {
+  // Volatile loads must retain the number and order of memory accesses.
+  if (op.getIsVolatile())
+    return failure();
+  if (succeeded(TritonToStructured::tryRewriteSegmentedBroadcastLoad(
+          op, rewriter, optimizeDynamicOffset)))
+    return success();
+  if (succeeded(TritonToStructured::tryRewriteSegmentedLoad(
+          op, rewriter, optimizeDynamicOffset)))
+    return success();
   auto loc = op.getLoc();
   auto oldPtr = op.getPtr();
   auto oldMask = op.getMask();
@@ -90,7 +101,8 @@ LogicalResult LoadConverter::matchAndRewrite(triton::LoadOp op,
 
   if (!tf.ptrState.shouldLinearize) {
     // no need to rewrite
-    return failure();
+    return TritonToStructured::tryRewriteSegmentedLoad(
+        op, rewriter, optimizeDynamicOffset, nullptr, true);
   }
 
   if (!newPtr) {
@@ -98,20 +110,30 @@ LogicalResult LoadConverter::matchAndRewrite(triton::LoadOp op,
       InFlightDiagnostic diag =
           emitWarning(loc) << "PtrAnalysis: failed to analyze load pointer.";
     });
-    return failure();
+    return TritonToStructured::tryRewriteSegmentedLoad(
+        op, rewriter, optimizeDynamicOffset, nullptr, true);
   }
 
-  if (!enableMaskFallbackConversion && oldMask && !newMask) {
-    LLVM_DEBUG({
-      InFlightDiagnostic diag = emitWarning(loc)
-                                << "MaskAnalysis: failed to analyze load mask.";
-    });
-    return failure();
+  if (oldMask && !newMask) {
+    // Prefer exact segmentation before considering the legacy select fallback,
+    // including when that optional fallback has been explicitly enabled.
+    if (succeeded(TritonToStructured::tryRewriteSegmentedLoad(
+            op, rewriter, optimizeDynamicOffset, nullptr, true)))
+      return success();
+    if (!enableMaskFallbackConversion || op->hasAttr("tts.segmented")) {
+      LLVM_DEBUG({
+        InFlightDiagnostic diag =
+            emitWarning(loc) << "MaskAnalysis: failed to analyze load mask.";
+      });
+      return failure();
+    }
   }
 
   auto loadOp = rewriter.create<triton::LoadOp>(loc, newPtr, newMask, newOther,
                                                 op.getCache(), op.getEvict(),
                                                 op.getIsVolatile());
+  if (op->hasAttr("tts.segmented"))
+    loadOp->setAttr("tts.segmented", rewriter.getUnitAttr());
 
   // insert implicit ops
   auto broadCastResult =
@@ -129,6 +151,12 @@ LogicalResult LoadConverter::matchAndRewrite(triton::LoadOp op,
 
 LogicalResult StoreConverter::matchAndRewrite(triton::StoreOp op,
                                               PatternRewriter &rewriter) const {
+  if (succeeded(TritonToStructured::tryRewriteSegmentedBroadcastStore(
+          op, rewriter, optimizeDynamicOffset)))
+    return success();
+  if (succeeded(TritonToStructured::tryRewriteSegmentedStore(
+          op, rewriter, optimizeDynamicOffset)))
+    return success();
   auto loc = op.getLoc();
   auto oldPtr = op.getPtr();
   auto oldMask = op.getMask();
@@ -139,9 +167,20 @@ LogicalResult StoreConverter::matchAndRewrite(triton::StoreOp op,
   auto newPtr = tf.createNewPtr(oldPtr, loc, rewriter);
   auto newMask = tf.createNewMask(oldMask, loc, rewriter);
 
+  // A zero-stride dimension represents repeated stores. Dropping it would
+  // discard distinct values and can even make the new store shapes disagree.
+  // Keep the original operation unless the segmented path proves injectivity.
+  if (llvm::any_of(tf.ptrState.stateInfo, [](const StateInfo &info) {
+        auto extent = getIntAttr(info.shape);
+        return isZero(info.stride) && (!extent || *extent > 1);
+      }))
+    return TritonToStructured::tryRewriteSegmentedStore(
+        op, rewriter, optimizeDynamicOffset, true);
+
   if (!tf.ptrState.shouldLinearize) {
     // no need to rewrite
-    return failure();
+    return TritonToStructured::tryRewriteSegmentedStore(
+        op, rewriter, optimizeDynamicOffset, true);
   }
 
   if (!newPtr) {
@@ -149,15 +188,23 @@ LogicalResult StoreConverter::matchAndRewrite(triton::StoreOp op,
       InFlightDiagnostic diag =
           emitWarning(loc) << "PtrAnalysis: failed to analyze store pointer.";
     });
-    return failure();
+    return TritonToStructured::tryRewriteSegmentedStore(
+        op, rewriter, optimizeDynamicOffset, true);
   }
 
-  if (!enableMaskFallbackConversion && oldMask && !newMask) {
-    LLVM_DEBUG({
-      InFlightDiagnostic diag =
-          emitWarning(loc) << "MaskAnalysis: failed to analyze store mask.";
-    });
-    return failure();
+  if (oldMask && !newMask) {
+    // Prefer exact segmentation before considering the legacy select fallback,
+    // including when that optional fallback has been explicitly enabled.
+    if (succeeded(TritonToStructured::tryRewriteSegmentedStore(
+            op, rewriter, optimizeDynamicOffset, true)))
+      return success();
+    if (!enableMaskFallbackConversion || op->hasAttr("tts.segmented")) {
+      LLVM_DEBUG({
+        InFlightDiagnostic diag =
+            emitWarning(loc) << "MaskAnalysis: failed to analyze store mask.";
+      });
+      return failure();
+    }
   }
 
   // insert sync_block_lock
@@ -176,6 +223,8 @@ LogicalResult StoreConverter::matchAndRewrite(triton::StoreOp op,
   auto storeOp = rewriter.create<triton::StoreOp>(
       loc, newPtr, permuteResult, newMask, op.getBoundaryCheck(), op.getCache(),
       op.getEvict());
+  if (op->hasAttr("tts.segmented"))
+    storeOp->setAttr("tts.segmented", rewriter.getUnitAttr());
 
   // insert sync_block_unlock
   if (oldMask && !newMask) {

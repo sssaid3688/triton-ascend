@@ -24,30 +24,16 @@ tt.func public @kernel_with_rem_safe(%arg0: !tt.ptr<f32> {tt.divisibility = 16 :
   tt.return
 }
 
-// CHECK-LABEL:   tt.func public @kernel_with_rem_safe(
-// CHECK-SAME:                                %[[VAL_0:.*]]: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %[[VAL_1:.*]]: !tt.ptr<f32> {tt.divisibility = 16 : i32}) attributes {noinline = false} {
-// CHECK:           %[[VAL_2:.*]] = arith.constant dense<0.000000e+00> : tensor<256xf32>
-// CHECK:           %[[VAL_3:.*]] = arith.constant dense<1024> : tensor<256xi32>
-// CHECK:           %[[VAL_4:.*]] = arith.constant 256 : i32
-// CHECK:           %[[VAL_5:.*]] = arith.constant dense<64> : tensor<256xi32>
-// CHECK:           %[[VAL_6:.*]] = arith.constant dense<128> : tensor<256xi32>
-// CHECK:           %[[VAL_7:.*]] = tt.get_program_id x : i32
-// CHECK:           %[[VAL_8:.*]] = tt.make_range {end = 256 : i32, start = 0 : i32} : tensor<256xi32>
-// CHECK:           %[[VAL_9:.*]] = arith.remsi %[[VAL_8]], %[[VAL_6]] : tensor<256xi32>
-// CHECK:           %[[VAL_10:.*]] = arith.cmpi slt, %[[VAL_9]], %[[VAL_5]] : tensor<256xi32>
-// CHECK:           %[[VAL_11:.*]] = arith.muli %[[VAL_7]], %[[VAL_4]] : i32
-// CHECK:           %[[VAL_12:.*]] = tt.splat %[[VAL_11]] : i32 -> tensor<256xi32>
-// CHECK:           %[[VAL_13:.*]] = arith.addi %[[VAL_12]], %[[VAL_8]] : tensor<256xi32>
-// CHECK:           %[[VAL_14:.*]] = arith.cmpi slt, %[[VAL_13]], %[[VAL_3]] : tensor<256xi32>
-// CHECK:           %[[VAL_15:.*]] = arith.andi %[[VAL_10]], %[[VAL_14]] : tensor<256xi1>
-// CHECK:           %[[VAL_16:.*]] = tt.splat %[[VAL_0]] : !tt.ptr<f32> -> tensor<256x!tt.ptr<f32>>
-// CHECK:           %[[VAL_17:.*]] = tt.addptr %[[VAL_16]], %[[VAL_9]] : tensor<256x!tt.ptr<f32>>, tensor<256xi32>
-// CHECK:           %[[VAL_18:.*]] = tt.load %[[VAL_17]], %[[VAL_15]], %[[VAL_2]] : tensor<256x!tt.ptr<f32>>
-// CHECK:           %[[VAL_19:.*]] = tt.splat %[[VAL_1]] : !tt.ptr<f32> -> tensor<256x!tt.ptr<f32>>
-// CHECK:           %[[VAL_20:.*]] = tt.addptr %[[VAL_19]], %[[VAL_8]] : tensor<256x!tt.ptr<f32>>, tensor<256xi32>
-// CHECK:           tt.store %[[VAL_20]], %[[VAL_18]], %[[VAL_15]] : tensor<256x!tt.ptr<f32>>
-// CHECK:           tt.return
-// CHECK:         }
+// The former expectation kept the original rem/masked load unchanged.
+// The periodic mask and dynamic global bound now lower through safe segments.
+// CHECK-LABEL: tt.func public @kernel_with_rem_safe(
+// CHECK-NOT: arith.remsi
+// CHECK: scf.if
+// CHECK: tt.load
+// CHECK: tensor.insert_slice
+// CHECK: tt.store
+// CHECK-NOT: arith.remsi
+// CHECK: tt.return
 
 
 // -----

@@ -74,7 +74,139 @@ bool isMultiple(const OpFoldResult &dividend, const OpFoldResult &divisor) {
   if (!staticDividend || !staticDivisor) {
     return false;
   }
+  if (staticDivisor.value() == 0)
+    return false;
+  if (staticDivisor.value() == -1)
+    return true;
   return staticDividend.value() % staticDivisor.value() == 0;
+}
+
+namespace {
+
+bool isLosslessSignedCast(Value source, Type target) {
+  auto sourceType = dyn_cast<IntegerType>(source.getType());
+  auto targetType = dyn_cast<IntegerType>(target);
+  if (sourceType && target.isIndex())
+    return sourceType.getWidth() <= 32;
+  return sourceType && targetType &&
+         sourceType.getWidth() <= targetType.getWidth();
+}
+
+// The supported indexing domain excludes signed index overflow. Preserve the
+// existing program-id fast path under that domain even when frontend IR omits
+// nsw; arbitrary signed parameters and their hints do not establish this fact.
+std::optional<bool> isProgramIdDerived(Value value, unsigned depth) {
+  if (!value || depth == 0)
+    return std::nullopt;
+  if (auto constant = getIntAttr(value))
+    return *constant >= 0 ? std::optional<bool>(false) : std::nullopt;
+  if (value.getDefiningOp<triton::GetProgramIdOp>() ||
+      value.getDefiningOp<triton::GetNumProgramsOp>())
+    return true;
+  if (auto cast = value.getDefiningOp<arith::IndexCastOp>()) {
+    if (!isLosslessSignedCast(cast.getIn(), value.getType()))
+      return std::nullopt;
+    return isProgramIdDerived(cast.getIn(), depth - 1);
+  }
+  if (auto ext = value.getDefiningOp<arith::ExtSIOp>())
+    return isProgramIdDerived(ext.getIn(), depth - 1);
+  Value lhs, rhs;
+  if (auto mul = value.getDefiningOp<arith::MulIOp>()) {
+    lhs = mul.getLhs();
+    rhs = mul.getRhs();
+  } else if (auto add = value.getDefiningOp<arith::AddIOp>()) {
+    lhs = add.getLhs();
+    rhs = add.getRhs();
+  } else {
+    return std::nullopt;
+  }
+  auto left = isProgramIdDerived(lhs, depth - 1);
+  auto right = isProgramIdDerived(rhs, depth - 1);
+  if (!left || !right || (!*left && !*right))
+    return std::nullopt;
+  return true;
+}
+
+bool isKnownNonNegative(Value value, unsigned depth) {
+  if (!value || depth == 0)
+    return false;
+  if (auto constant = getIntAttr(value))
+    return *constant >= 0;
+  if (value.getDefiningOp<triton::GetProgramIdOp>() ||
+      value.getDefiningOp<triton::GetNumProgramsOp>())
+    return true;
+  if (auto cast = value.getDefiningOp<arith::IndexCastOp>())
+    return isLosslessSignedCast(cast.getIn(), value.getType()) &&
+           isKnownNonNegative(cast.getIn(), depth - 1);
+  if (auto ext = value.getDefiningOp<arith::ExtSIOp>())
+    return isKnownNonNegative(ext.getIn(), depth - 1);
+  if (value.getDefiningOp<arith::ExtUIOp>())
+    return true;
+  // Otherwise require nsw, except for the established program-id indexing
+  // domain above. A hint on an arbitrary signed argument is not a sign proof.
+  if (auto mul = value.getDefiningOp<arith::MulIOp>())
+    return ((mul.getOverflowFlags() & arith::IntegerOverflowFlags::nsw) !=
+                arith::IntegerOverflowFlags::none ||
+            isProgramIdDerived(value, depth).value_or(false)) &&
+           isKnownNonNegative(mul.getLhs(), depth - 1) &&
+           isKnownNonNegative(mul.getRhs(), depth - 1);
+  if (auto add = value.getDefiningOp<arith::AddIOp>())
+    return ((add.getOverflowFlags() & arith::IntegerOverflowFlags::nsw) !=
+                arith::IntegerOverflowFlags::none ||
+            isProgramIdDerived(value, depth).value_or(false)) &&
+           isKnownNonNegative(add.getLhs(), depth - 1) &&
+           isKnownNonNegative(add.getRhs(), depth - 1);
+  return false;
+}
+
+bool isKnownMultiple(Value value, int64_t divisor, unsigned depth) {
+  if (!value || depth == 0)
+    return false;
+  // Actual constants take precedence over optional divisibility annotations.
+  if (auto constant = getIntAttr(value))
+    return *constant % divisor == 0;
+  if (auto cast = value.getDefiningOp<arith::IndexCastOp>())
+    return isLosslessSignedCast(cast.getIn(), value.getType()) &&
+           isKnownMultiple(cast.getIn(), divisor, depth - 1);
+  if (auto ext = value.getDefiningOp<arith::ExtSIOp>())
+    return isKnownMultiple(ext.getIn(), divisor, depth - 1);
+  if (divisor == 1)
+    return true;
+  if (auto multiple = extractDivisibilityFromOpFoldResult(value))
+    if (*multiple > 0 && *multiple % divisor == 0)
+      return true;
+  bool powerOfTwo = (divisor & (divisor - 1)) == 0;
+  if (auto mul = value.getDefiningOp<arith::MulIOp>()) {
+    bool noSignedWrap =
+        (mul.getOverflowFlags() & arith::IntegerOverflowFlags::nsw) !=
+        arith::IntegerOverflowFlags::none;
+    return (powerOfTwo || noSignedWrap ||
+            isProgramIdDerived(value, depth).value_or(false)) &&
+           (isKnownMultiple(mul.getLhs(), divisor, depth - 1) ||
+            isKnownMultiple(mul.getRhs(), divisor, depth - 1));
+  }
+  if (auto add = value.getDefiningOp<arith::AddIOp>()) {
+    bool noSignedWrap =
+        (add.getOverflowFlags() & arith::IntegerOverflowFlags::nsw) !=
+        arith::IntegerOverflowFlags::none;
+    return (powerOfTwo || noSignedWrap ||
+            isProgramIdDerived(value, depth).value_or(false)) &&
+           isKnownMultiple(add.getLhs(), divisor, depth - 1) &&
+           isKnownMultiple(add.getRhs(), divisor, depth - 1);
+  }
+  return false;
+}
+
+} // namespace
+
+bool isKnownNonNegativeMultiple(OpFoldResult value, int64_t divisor) {
+  if (divisor <= 0)
+    return false;
+  if (auto constant = getIntAttr(value))
+    return *constant >= 0 && *constant % divisor == 0;
+  auto scalar = dyn_cast<Value>(value);
+  return isKnownNonNegative(scalar, 16) &&
+         isKnownMultiple(scalar, divisor, 16);
 }
 
 bool isEqual(const OpFoldResult &ofr1, const OpFoldResult &ofr2) {
@@ -1083,35 +1215,28 @@ LogicalResult PtrAnalysis::visitOperandRem(arith::RemSIOp remOp,
     return failure();
   }
 
-  if (visitOperand(remOp.getLhs(), state, loc, builder).failed()) {
+  PtrState lhsState;
+  if (visitOperand(remOp.getLhs(), lhsState, loc, builder).failed()) {
     return failure();
   }
-
-  bool hasAnnotation = optimizeDynamicOffset;
 
   auto zeroAttr = builder.getIndexAttr(0);
   auto oneAttr = builder.getIndexAttr(1);
   auto divisorAttr = rhsState.offset;
 
-  auto staticOffset = getIntAttr(state.offset);
-  if ((!staticOffset.has_value() || !isMultiple(state.offset, divisorAttr)) &&
-      !hasAnnotation) {
+  auto staticDivisor = getIntAttr(divisorAttr);
+  if (!staticDivisor || *staticDivisor <= 0 ||
+      !isKnownNonNegativeMultiple(lhsState.offset, *staticDivisor)) {
     LLVM_DEBUG({
       remOp.emitRemark(
-          "PtrAnalysis: dynamic offset before REMSI, adding annotation");
-    });
-    return failure();
-  }
-
-  if (!getIntAttr(divisorAttr).has_value()) {
-    LLVM_DEBUG({
-      remOp.emitError("PtrAnalysis: do not support dynamix divisor in REMSI.");
+          "PtrAnalysis: rectangular REMSI requires a positive static divisor "
+          "and a proven nonnegative, divisible offset");
     });
     return failure();
   }
 
   SmallVector<StateInfo> newStateInfo;
-  for (auto info : state.stateInfo) {
+  for (auto info : lhsState.stateInfo) {
     if (!getIntAttr(info.stride).has_value()) {
       LLVM_DEBUG({
         remOp.emitError(
@@ -1120,13 +1245,10 @@ LogicalResult PtrAnalysis::visitOperandRem(arith::RemSIOp remOp,
       return failure();
     }
 
-    if (!isMultiple(divisorAttr, info.shape) &&
-        !isMultiple(info.shape, divisorAttr)) {
-      LLVM_DEBUG({
-        remOp.emitError(
-            "PtrAnalysis: do not support dynamix stride before REMSI.");
-      });
-    }
+    auto staticShape = getIntAttr(info.shape);
+    auto stride = getIntAttr(info.stride);
+    if (!staticShape || *staticShape <= 0 || !stride || *stride < 0)
+      return failure();
 
     if (isMultiple(info.stride, divisorAttr)) {
       newStateInfo.emplace_back(zeroAttr, info.shape, info.dimIndex);
@@ -1135,6 +1257,8 @@ LogicalResult PtrAnalysis::visitOperandRem(arith::RemSIOp remOp,
           divOpFoldResult(divisorAttr, info.stride, loc, builder);
       contiguousSize =
           minOpFoldResult(contiguousSize, info.shape, loc, builder);
+      if (!isMultiple(info.shape, contiguousSize))
+        return failure();
       auto nonContiguousSize =
           divOpFoldResult(info.shape, contiguousSize, loc, builder);
 
@@ -1161,9 +1285,9 @@ LogicalResult PtrAnalysis::visitOperandRem(arith::RemSIOp remOp,
     }
   }
 
-  auto newOffset = remOpFoldResult(state.offset, divisorAttr, loc, builder);
-  state.updatePtrState(newStateInfo, state.sizes, state.source, newOffset, loc,
-                       builder, true);
+  auto newOffset = remOpFoldResult(lhsState.offset, divisorAttr, loc, builder);
+  state.updatePtrState(newStateInfo, lhsState.sizes, lhsState.source, newOffset,
+                       loc, builder, true);
 
   LLVM_DEBUG({
     llvm::dbgs() << "after VisitRemOperands \n";
@@ -1201,16 +1325,9 @@ LogicalResult PtrAnalysis::visitOperandDiv(arith::DivSIOp divOp,
     return failure();
   }
 
-  if (visitOperand(divOp.getLhs(), state, loc, builder).failed()) {
+  PtrState lhsState;
+  if (visitOperand(divOp.getLhs(), lhsState, loc, builder).failed()) {
     return failure();
-  }
-
-  bool hasAnnotation = optimizeDynamicOffset;
-
-  auto staticMultipleOf = extractDivisibilityFromOpFoldResult(state.offset);
-  if (!hasAnnotation && staticMultipleOf.has_value()) {
-    auto attr = builder.getIndexAttr(staticMultipleOf.value());
-    hasAnnotation = isMultiple(attr, rhsState.offset);
   }
 
   // add divState
@@ -1218,25 +1335,19 @@ LogicalResult PtrAnalysis::visitOperandDiv(arith::DivSIOp divOp,
   auto oneAttr = builder.getIndexAttr(1);
   auto divisorAttr = rhsState.offset;
 
-  auto staticOffset = getIntAttr(state.offset);
-  if ((!staticOffset.has_value() || !isMultiple(state.offset, divisorAttr)) &&
-      !hasAnnotation) {
+  auto staticDivisor = getIntAttr(divisorAttr);
+  if (!staticDivisor || *staticDivisor <= 0 ||
+      !isKnownNonNegativeMultiple(lhsState.offset, *staticDivisor)) {
     LLVM_DEBUG({
       divOp.emitRemark(
-          "PtrAnalysis: dynamic offset before DIVSI, adding annotation");
-    });
-    return failure();
-  }
-
-  if (!getIntAttr(divisorAttr).has_value()) {
-    LLVM_DEBUG({
-      divOp.emitError("PtrAnalysis: do not support dynamix divisor in DIVSI.");
+          "PtrAnalysis: rectangular DIVSI requires a positive static divisor "
+          "and a proven nonnegative, divisible offset");
     });
     return failure();
   }
 
   SmallVector<StateInfo> newStateInfo;
-  for (auto info : state.stateInfo) {
+  for (auto info : lhsState.stateInfo) {
     auto staticStride = getIntAttr(info.stride);
     if (!staticStride.has_value()) {
       LLVM_DEBUG({
@@ -1246,13 +1357,10 @@ LogicalResult PtrAnalysis::visitOperandDiv(arith::DivSIOp divOp,
       return failure();
     }
 
-    if (!isMultiple(divisorAttr, info.shape) &&
-        !isMultiple(info.shape, divisorAttr)) {
-      LLVM_DEBUG({
-        divOp.emitError(
-            "PtrAnalysis: do not support dynamix stride before DivSI.");
-      });
-    }
+    auto staticShape = getIntAttr(info.shape);
+    auto stride = getIntAttr(info.stride);
+    if (!staticShape || *staticShape <= 0 || !stride || *stride < 0)
+      return failure();
 
     if (isMultiple(info.stride, divisorAttr)) {
       auto newStride = divOpFoldResult(info.stride, divisorAttr, loc, builder);
@@ -1262,6 +1370,8 @@ LogicalResult PtrAnalysis::visitOperandDiv(arith::DivSIOp divOp,
           divOpFoldResult(divisorAttr, info.stride, loc, builder);
       nonContiguousSize =
           minOpFoldResult(nonContiguousSize, info.shape, loc, builder);
+      if (!isMultiple(info.shape, nonContiguousSize))
+        return failure();
       auto contiguousSize =
           divOpFoldResult(info.shape, nonContiguousSize, loc, builder);
 
@@ -1288,9 +1398,9 @@ LogicalResult PtrAnalysis::visitOperandDiv(arith::DivSIOp divOp,
     }
   }
 
-  auto newOffset = divOpFoldResult(state.offset, divisorAttr, loc, builder);
-  state.updatePtrState(newStateInfo, state.sizes, state.source, newOffset, loc,
-                       builder, true);
+  auto newOffset = divOpFoldResult(lhsState.offset, divisorAttr, loc, builder);
+  state.updatePtrState(newStateInfo, lhsState.sizes, lhsState.source, newOffset,
+                       loc, builder, true);
 
   LLVM_DEBUG({
     llvm::dbgs() << "after VisitDivOperands \n";

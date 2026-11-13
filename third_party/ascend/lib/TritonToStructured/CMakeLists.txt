@@ -4,6 +4,8 @@ add_triton_library(TritonToStructured
         CannonicalizerConverter.cpp
         MemOpConverter.cpp
         MaskAnalysis.cpp
+        SegmentPlan.cpp
+        SegmentLift.cpp
 
   DEPENDS
   TritonToStructuredConversionPassIncGen

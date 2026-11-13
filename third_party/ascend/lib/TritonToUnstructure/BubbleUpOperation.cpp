@@ -44,7 +44,18 @@ BubbleUpExtract<ExtractOpTy>::matchAndRewrite(ExtractOpTy op,
     tensorValue = op.getTensor();
   } else if constexpr (std::is_same_v<ExtractOpTy, tensor::ExtractSliceOp>) {
     tensorValue = op.getSource();
-    if (tensorValue.getType() == op.getResult().getType()) {
+    // Segmented memory operations deliberately keep dynamic tensor slices.
+    // Bubbling them into TT splats/ranges would create dynamic TT tensors,
+    // whose constant folding requires a static shape.
+    auto resultType = cast<RankedTensorType>(op.getResult().getType());
+    if (!resultType.hasStaticShape())
+      return rewriter.notifyMatchFailure(op, "preserve dynamic segment slice");
+    bool identity = tensorValue.getType() == resultType;
+    for (auto offset : op.getMixedOffsets())
+      identity &= isZero(offset);
+    for (auto stride : op.getMixedStrides())
+      identity &= isOne(stride);
+    if (identity) {
       rewriter.replaceAllUsesWith(op.getResult(), tensorValue);
       rewriter.eraseOp(op);
       return success();
@@ -377,13 +388,40 @@ template <>
 void BubbleUpExtract<tensor::ExtractSliceOp>::bubbleUpOperation(
     tensor::ExtractSliceOp op, triton::MakeRangeOp parentOp, Location loc,
     PatternRewriter &rewriter) const {
-  auto resultType = cast<RankedTensorType>(parentOp.getResult().getType());
-  auto idxOfr = op.getMixedOffsets()[0];
-  Value idx = getValueOrCreateConstantIndexOp(rewriter, op.getLoc(), idxOfr);
-  idx = rewriter.create<arith::IndexCastOp>(op.getLoc(),
-                                            resultType.getElementType(), idx);
-  rewriter.replaceOpWithNewOp<triton::SplatOp>(op, op.getResult().getType(),
-                                               idx);
+  auto resultType = cast<RankedTensorType>(op.getResult().getType());
+  Type elementType = resultType.getElementType();
+  Value offset =
+      getValueOrCreateConstantIndexOp(rewriter, loc, op.getMixedOffsets()[0]);
+  Value first = rewriter.create<arith::IndexCastOp>(loc, elementType, offset);
+  if (parentOp.getStart() != 0) {
+    Value start = rewriter.create<arith::ConstantOp>(
+        loc, rewriter.getIntegerAttr(elementType, parentOp.getStart()));
+    first = rewriter.createOrFold<arith::AddIOp>(loc, first, start);
+  }
+  if (resultType.getRank() == 0) {
+    rewriter.replaceOpWithNewOp<triton::SplatOp>(op, resultType, first);
+    return;
+  }
+  int64_t count = resultType.getNumElements();
+  if (count == 0) {
+    rewriter.replaceOpWithNewOp<tensor::EmptyOp>(op, resultType.getShape(),
+                                                 elementType);
+    return;
+  }
+  // Preserve every lane of the slice, including its stride and the source
+  // range start. A splat of the offset is only correct for a single element.
+  Value result =
+      rewriter.create<triton::MakeRangeOp>(loc, resultType, 0, count);
+  if (!isOne(op.getMixedStrides()[0])) {
+    Value stride =
+        getValueOrCreateConstantIndexOp(rewriter, loc, op.getMixedStrides()[0]);
+    stride = rewriter.create<arith::IndexCastOp>(loc, elementType, stride);
+    Value steps = rewriter.create<triton::SplatOp>(loc, resultType, stride);
+    result = rewriter.create<arith::MulIOp>(loc, result, steps);
+  }
+  Value origins = rewriter.create<triton::SplatOp>(loc, resultType, first);
+  result = rewriter.create<arith::AddIOp>(loc, result, origins);
+  rewriter.replaceOp(op, result);
 }
 
 template <typename ExtractOpTy>

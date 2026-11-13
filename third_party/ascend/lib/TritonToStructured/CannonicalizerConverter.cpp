@@ -259,6 +259,8 @@ AddPtrSplatConverter::matchAndRewrite(triton::AddPtrOp addPtrOp,
 LogicalResult
 LoadBroadcastConverter::matchAndRewrite(triton::LoadOp loadOp,
                                         PatternRewriter &rewriter) const {
+  if (loadOp.getIsVolatile())
+    return failure();
   // Match when ptr is defined by BroadcastOp
   Value ptr = loadOp.getPtr();
   auto ptrBroadcast = ptr.getDefiningOp<triton::BroadcastOp>();

@@ -1090,6 +1090,130 @@ AtomicMaxMinCanonicalizer::matchAndRewrite(triton::AtomicRMWOp op,
   return success();
 }
 
+// A segmented store uses a static carrier so TT tensor shapes stay static:
+//   empty<C> <- insert_slice(valid dynamic prefix) <- expand_shape<Q x P>.
+// The store mask restricts every access to that prefix. Read directly from the
+// inserted tensor instead of materializing the carrier in local memory.
+static Value stripSegmentIndexCasts(Value value) {
+  while (auto cast = value.getDefiningOp<arith::IndexCastOp>()) {
+    auto source = cast.getIn();
+    unsigned sourceWidth = source.getType().isIndex()
+                               ? 64
+                               : source.getType().getIntOrFloatBitWidth();
+    unsigned destWidth = value.getType().isIndex()
+                             ? 64
+                             : value.getType().getIntOrFloatBitWidth();
+    if (sourceWidth > destWidth)
+      break;
+    value = source;
+  }
+  return value;
+}
+
+static bool segmentPrefixBoundedBy(OpFoldResult request, OpFoldResult bound,
+                                   unsigned depth = 0) {
+  if (request == bound)
+    return true;
+  auto requestInt = getConstantIntValue(request);
+  auto boundInt = getConstantIntValue(bound);
+  if (requestInt && boundInt)
+    return *requestInt >= 0 && *requestInt <= *boundInt;
+  if (depth > 8)
+    return false;
+  auto requestedValue = dyn_cast<Value>(request);
+  auto boundValue = dyn_cast<Value>(bound);
+  if (!requestedValue)
+    return requestInt && *requestInt == 0;
+  requestedValue = stripSegmentIndexCasts(requestedValue);
+  if (boundValue && requestedValue == stripSegmentIndexCasts(boundValue))
+    return true;
+  if (auto min = requestedValue.getDefiningOp<arith::MinSIOp>())
+    return segmentPrefixBoundedBy(getAsOpFoldResult(min.getLhs()), bound,
+                                  depth + 1) ||
+           segmentPrefixBoundedBy(getAsOpFoldResult(min.getRhs()), bound,
+                                  depth + 1);
+  // A well-formed inserted prefix has a non-negative length, so clamping a
+  // request below that length against zero cannot exceed the inserted extent.
+  if (auto max = requestedValue.getDefiningOp<arith::MaxSIOp>())
+    return segmentPrefixBoundedBy(getAsOpFoldResult(max.getLhs()), bound,
+                                  depth + 1) &&
+           segmentPrefixBoundedBy(getAsOpFoldResult(max.getRhs()), bound,
+                                  depth + 1);
+  return false;
+}
+
+static Value bypassSegmentStoreCarrier(tensor::ExtractSliceOp requested,
+                                       PatternRewriter &rewriter) {
+  Value carrier = requested.getSource();
+  auto expand = carrier.getDefiningOp<tensor::ExpandShapeOp>();
+  auto carrierType = cast<RankedTensorType>(carrier.getType());
+  int64_t innerSize = 1;
+  if (expand) {
+    if (carrierType.getRank() != 2 || !carrierType.hasStaticShape() ||
+        cast<RankedTensorType>(expand.getSrc().getType()).getRank() != 1 ||
+        expand.getReassociationIndices() !=
+            SmallVector<ReassociationIndices>{{0, 1}})
+      return {};
+    innerSize = carrierType.getDimSize(1);
+    carrier = expand.getSrc();
+  } else if (carrierType.getRank() != 1) {
+    return {};
+  }
+  auto inserted = carrier.getDefiningOp<tensor::InsertSliceOp>();
+  if (!inserted || !inserted.getDest().getDefiningOp<tensor::EmptyOp>() ||
+      inserted.getMixedOffsets().size() != 1 ||
+      !isZero(inserted.getMixedOffsets()[0]) ||
+      !isOne(inserted.getMixedStrides()[0]))
+    return {};
+  // The inserted prefix covers whole rows. Any legal column interval of
+  // the original carrier remains legal in the direct source with that same
+  // inner extent; only the outer row prefix must start at zero.
+  if (!isZero(requested.getMixedOffsets().front()))
+    return {};
+  for (auto stride : requested.getMixedStrides())
+    if (!isOne(stride))
+      return {};
+  auto prefixSize = inserted.getMixedSizes()[0];
+  OpFoldResult prefixRows = prefixSize;
+  if (expand && innerSize != 1) {
+    if (auto n = getConstantIntValue(prefixSize)) {
+      if (*n % innerSize)
+        return {};
+      prefixRows = rewriter.getIndexAttr(*n / innerSize);
+    } else {
+      Value dynamicSize = stripSegmentIndexCasts(cast<Value>(prefixSize));
+      auto mul = dynamicSize.getDefiningOp<arith::MulIOp>();
+      if (!mul)
+        return {};
+      auto left = getConstantIntValue(getAsOpFoldResult(mul.getLhs()));
+      auto right = getConstantIntValue(getAsOpFoldResult(mul.getRhs()));
+      if (left && *left == innerSize)
+        prefixRows = getAsOpFoldResult(mul.getRhs());
+      else if (right && *right == innerSize)
+        prefixRows = getAsOpFoldResult(mul.getLhs());
+      else
+        return {};
+    }
+  }
+  auto sizes = requested.getMixedSizes();
+  if (!segmentPrefixBoundedBy(sizes[0], prefixRows))
+    return {};
+  Value source = inserted.getSource();
+  if (expand) {
+    auto sourceType = cast<RankedTensorType>(source.getType());
+    auto rows = getConstantIntValue(prefixRows);
+    auto expandedType =
+        RankedTensorType::get({rows ? *rows : ShapedType::kDynamic, innerSize},
+                              sourceType.getElementType());
+    source = rewriter.create<tensor::ExpandShapeOp>(
+        requested.getLoc(), expandedType, source,
+        SmallVector<ReassociationIndices>{{0, 1}});
+  }
+  return rewriter.create<tensor::ExtractSliceOp>(
+      requested.getLoc(), requested.getType(), source,
+      requested.getMixedOffsets(), sizes, requested.getMixedStrides());
+}
+
 StoreConverter::StoreConverter(MLIRContext *context)
     : OpConversionPattern<triton::StoreOp>(context) {}
 
@@ -1171,9 +1295,14 @@ StoreConverter::matchAndRewrite(triton::StoreOp op, OpAdaptor adaptor,
   }
   LLVM_DEBUG({ llvm::dbgs() << *getModuleOpFromOperation(op) << "\n"; });
   auto srcSlice = mstate.getExtractSlice(val, loc, rewriter);
+  Value storeSource = srcSlice;
+  if (Value direct = bypassSegmentStoreCarrier(srcSlice, rewriter)) {
+    storeSource = direct;
+    rewriter.eraseOp(srcSlice);
+  }
   auto dstSubview = mstate.getSubview(ptr, loc, rewriter);
   auto storeOp = rewriter.create<bufferization::MaterializeInDestinationOp>(
-      loc, srcSlice, dstSubview);
+      loc, storeSource, dstSubview);
   storeOp.setWritable(true);
   rewriter.eraseOp(op);
   return success();

@@ -188,6 +188,9 @@ public:
 };
 
 bool isMultiple(const OpFoldResult &dividend, const OpFoldResult &divisor);
+// A rectangular div/rem split is valid only for a proven nonnegative,
+// zero-phase offset; an optimization option is not an alignment proof.
+bool isKnownNonNegativeMultiple(OpFoldResult value, int64_t divisor);
 bool isEqual(const OpFoldResult &ofr1, const OpFoldResult &ofr2);
 bool isLess(const OpFoldResult &ofs1, const OpFoldResult &ofs2);
 bool isGreater(const OpFoldResult &ofs1, const OpFoldResult &ofs2);

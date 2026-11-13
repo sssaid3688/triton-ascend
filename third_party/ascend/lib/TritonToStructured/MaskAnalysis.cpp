@@ -598,7 +598,8 @@ LogicalResult MaskState::parseRem(arith::RemSIOp remOp, const Location loc,
 
   auto divisorAttr = rhsState.scalar;
 
-  if (!getIntAttr(divisorAttr).has_value()) {
+  auto staticDivisor = getIntAttr(divisorAttr);
+  if (!staticDivisor || *staticDivisor <= 0) {
     LLVM_DEBUG({
       remOp.emitError("MaskAnalysis: do not support dynamic divisor in REMSI.");
     });
@@ -612,17 +613,15 @@ LogicalResult MaskState::parseRem(arith::RemSIOp remOp, const Location loc,
       newStateInfo.emplace_back(info);
       continue;
     }
-    if (!isMultiple(divisorAttr, info.shape) &&
-        !isMultiple(info.shape, divisorAttr)) {
-      LLVM_DEBUG({
-        remOp.emitError(
-            "MaskAnalysis: do not support dynamic stride before REMSI.");
-      });
+    auto staticShape = getIntAttr(info.shape);
+    if (!staticShape || *staticShape <= 0 ||
+        !isKnownNonNegativeMultiple(info.offset, *staticDivisor))
       return failure();
-    }
 
     auto contiguousSize =
         minOpFoldResult(divisorAttr, info.shape, loc, builder);
+    if (!isMultiple(info.shape, contiguousSize))
+      return failure();
     auto nonContiguousSize =
         divOpFoldResult(info.shape, contiguousSize, loc, builder);
 
@@ -635,12 +634,12 @@ LogicalResult MaskState::parseRem(arith::RemSIOp remOp, const Location loc,
       return failure();
     }
 
-    if (staticNonContiguousSize.value() != 0)
+    if (staticNonContiguousSize.value() > 1)
       newStateInfo.emplace_back(zeroAttr, nonContiguousSize, info.dimIndex,
                                 true);
 
     auto newOffset = remOpFoldResult(info.offset, divisorAttr, loc, builder);
-    newStateInfo.emplace_back(newOffset, nonContiguousSize, info.dimIndex);
+    newStateInfo.emplace_back(newOffset, contiguousSize, info.dimIndex);
   }
 
   this->stateInfo = newStateInfo;
@@ -687,7 +686,8 @@ LogicalResult MaskState::parseDiv(arith::DivSIOp divOp, const Location loc,
 
   auto divisorAttr = rhsState.scalar;
 
-  if (!getIntAttr(divisorAttr).has_value()) {
+  auto staticDivisor = getIntAttr(divisorAttr);
+  if (!staticDivisor || *staticDivisor <= 0) {
     LLVM_DEBUG({
       divOp.emitError("MaskAnalysis: do not support dynamix divisor in DIVSI.");
     });
@@ -701,17 +701,15 @@ LogicalResult MaskState::parseDiv(arith::DivSIOp divOp, const Location loc,
       newStateInfo.emplace_back(info);
       continue;
     }
-    if (!isMultiple(divisorAttr, info.shape) &&
-        !isMultiple(info.shape, divisorAttr)) {
-      LLVM_DEBUG({
-        divOp.emitError(
-            "MaskAnalysis: do not support dynamix stride before DIVSI.");
-      });
+    auto staticShape = getIntAttr(info.shape);
+    if (!staticShape || *staticShape <= 0 ||
+        !isKnownNonNegativeMultiple(info.offset, *staticDivisor))
       return failure();
-    }
 
     auto nonContiguousSize =
         minOpFoldResult(divisorAttr, info.shape, loc, builder);
+    if (!isMultiple(info.shape, nonContiguousSize))
+      return failure();
     auto contiguousSize =
         divOpFoldResult(info.shape, nonContiguousSize, loc, builder);
 
